@@ -1,6 +1,7 @@
 ## Updates
-- November 2, 2023: Added support for Mixed Precision
-- March 14, 2023: Added support for PyTorch (latest for pytorch 2.1.0)
+- July 12, 2026: Optimized pytorch CUDA implementation.
+- November 2, 2023: Added support for Mixed Precision.
+- March 14, 2023: Added support for PyTorch (latest for pytorch 2.1.0).
 
 ## Code-for-MPELU
 Code for Improving Deep Neural Network with Multiple Parametric Exponential Linear Units, [arXiv:1606.00305](https://arxiv.org/abs/1606.00305)
