@@ -19,8 +19,10 @@ setup(
             sources=sources,
             include_dirs=include_dirs,
             extra_compile_args={
-                'cxx': ['-O2'],
-                'nvcc': ['-O2', '-G', '-lineinfo']  # Add debug flags here
+                'cxx': ['-O3'],
+                # Keep line information for profiling without enabling CUDA's
+                # device-debug mode (-G), which disables key optimizations.
+                'nvcc': ['-O3', '-lineinfo']
             }
         )
     ],

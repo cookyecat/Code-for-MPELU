@@ -1,168 +1,186 @@
 #include <torch/extension.h>
+
+#include <ATen/AccumulateType.h>
 #include <ATen/cuda/Atomic.cuh>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+
+#include <algorithm>
+
+namespace {
+
+constexpr int kThreads = 256;
 
 template <typename scalar_t>
 __global__ void mpelu_forward_cuda_kernel(
-    const torch::PackedTensorAccessor<scalar_t, 4, torch::RestrictPtrTraits, size_t> input,
-    const torch::PackedTensorAccessor<scalar_t, 1, torch::RestrictPtrTraits, size_t> a,
-    const torch::PackedTensorAccessor<scalar_t, 1, torch::RestrictPtrTraits, size_t> b,
-    torch::PackedTensorAccessor<scalar_t, 4, torch::RestrictPtrTraits, size_t> output,
-    const int width, const int height
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ alpha,
+    const scalar_t* __restrict__ beta,
+    scalar_t* __restrict__ output,
+    int64_t num_elements,
+    int64_t channels,
+    int64_t spatial_size
 ) {
-    const int batch_idx = blockIdx.z;
-    const int channel_idx = blockIdx.y;
-    const int pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (pixel_idx < width * height) {
-        int x = pixel_idx % width;
-        int y = pixel_idx / width;
-
-        scalar_t in_val = input[batch_idx][channel_idx][y][x];
-        if (in_val < 0) {
-            output[batch_idx][channel_idx][y][x] = a[channel_idx] * (exp(b[channel_idx] * in_val) - 1);
-        } else {
-            output[batch_idx][channel_idx][y][x] = in_val;
-        }
+    using acc_t = at::acc_type<scalar_t, true>;
+    for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < num_elements;
+         index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        const int64_t channel = (index / spatial_size) % channels;
+        const acc_t value = static_cast<acc_t>(input[index]);
+        const acc_t result = value > acc_t(0)
+            ? value
+            : static_cast<acc_t>(alpha[channel]) *
+                (exp(static_cast<acc_t>(beta[channel]) * value) - acc_t(1));
+        output[index] = static_cast<scalar_t>(result);
     }
 }
 
-/*
-=============== Solution 1 for atomicAdd not support for (c10::Half *, c10::Half) ===============
-adapted from https://github.com/torch/cutorch/blob/master/lib/THC/THCAtomics.cuh
-https://forums.developer.nvidia.com/t/atomicadd-not-overloaded-for-c10-half/204474/2
-__device__ __forceinline__ void atomicAdd(c10::Half* address, c10::Half val) {
-    unsigned int *address_as_ui = reinterpret_cast<unsigned int *>(reinterpret_cast<char *>(address) - (reinterpret_cast<size_t>(address) & 2));
-    unsigned int old = *address_as_ui;
-    unsigned int assumed;
-
-    do {
-        assumed = old;
-        unsigned short hsum = reinterpret_cast<size_t>(address) & 2 ? (old >> 16) : (old & 0xffff);
-        hsum += val;
-        old = reinterpret_cast<size_t>(address) & 2
-                 ? (old & 0xffff) | (hsum << 16)
-                 : (old & 0xffff0000) | hsum;
-        old = atomicCAS(address_as_ui, assumed, old);
-
-    // Note: uses integer comparison to avoid hang in case of NaN (since NaN != NaN)
-    } while (assumed != old);
-}
-=============== End: Solution 1 for atomicAdd not support for (c10::Half *, c10::Half) ===============
-
-=============== Solution 2 for atomicAdd not support for (c10::Half *, c10::Half) ===============
-https://discuss.pytorch.org/t/c10-half-float-type-support-for-atomicadd/137628/2
-Use gpuAtomicAdd rather than atomicAdd:
-https://github.com/pytorch/pytorch/blob/085e2f7bddc45f859fcdb786926d60d709b2daa0/aten/src/ATen/cuda/Atomic.cuh#L181-L190
-=============== End: Solution 2 for atomicAdd not support for (c10::Half *, c10::Half) =============== 
-*/
-
+// Each block owns one (batch, channel) plane. Threads calculate grad_input
+// while reducing both channel-wise parameter gradients in shared memory.
+// Consequently, each block performs only two global atomic additions instead
+// of two atomic additions for every input element.
 template <typename scalar_t>
 __global__ void mpelu_backward_cuda_kernel(
-    const torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits,size_t> input,
-    const torch::PackedTensorAccessor<scalar_t,1,torch::RestrictPtrTraits,size_t> a,
-    const torch::PackedTensorAccessor<scalar_t,1,torch::RestrictPtrTraits,size_t> b,
-    const torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits,size_t> output,    
-    const torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits,size_t> grad_output,
-    torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits,size_t> grad_input,
-    torch::PackedTensorAccessor<scalar_t,1,torch::RestrictPtrTraits,size_t> grad_a,
-    torch::PackedTensorAccessor<scalar_t,1,torch::RestrictPtrTraits,size_t> grad_b,
-    const int width, const int height
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ alpha,
+    const scalar_t* __restrict__ beta,
+    const scalar_t* __restrict__ grad_output,
+    scalar_t* __restrict__ grad_input,
+    at::acc_type<scalar_t, true>* __restrict__ grad_alpha,
+    at::acc_type<scalar_t, true>* __restrict__ grad_beta,
+    int64_t channels,
+    int64_t spatial_size
 ) {
-    const int batch_idx = blockIdx.z;
-    const int channel_idx = blockIdx.y;
-    const int pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    using acc_t = at::acc_type<scalar_t, true>;
+    extern __shared__ unsigned char shared_bytes[];
+    acc_t* shared_alpha = reinterpret_cast<acc_t*>(shared_bytes);
+    acc_t* shared_beta = shared_alpha + blockDim.x;
 
-    if (pixel_idx < width * height) {
-        int x = pixel_idx % width;
-        int y = pixel_idx / width;
+    const int64_t batch_channel = blockIdx.x;
+    const int64_t channel = batch_channel % channels;
+    const int64_t offset = batch_channel * spatial_size;
+    const acc_t alpha_value = static_cast<acc_t>(alpha[channel]);
+    const acc_t beta_value = static_cast<acc_t>(beta[channel]);
+    acc_t alpha_sum = acc_t(0);
+    acc_t beta_sum = acc_t(0);
 
-        const scalar_t inp = input[batch_idx][channel_idx][y][x];
-        const scalar_t oup = output[batch_idx][channel_idx][y][x];
-        const scalar_t grad_out = grad_output[batch_idx][channel_idx][y][x];
+    for (int64_t pixel = threadIdx.x; pixel < spatial_size;
+         pixel += blockDim.x) {
+        const int64_t index = offset + pixel;
+        const acc_t value = static_cast<acc_t>(input[index]);
+        const acc_t upstream = static_cast<acc_t>(grad_output[index]);
 
-        atomicAdd(&grad_a[channel_idx], grad_out * (inp <= 0) * (oup / a[channel_idx]));
-        atomicAdd(&grad_b[channel_idx], grad_out * (inp <= 0) * inp * (oup + a[channel_idx]));
-        grad_input[batch_idx][channel_idx][y][x] = grad_out * ( (inp > 0) + (inp <= 0) * b[channel_idx] * (oup + a[channel_idx]));
+        if (value <= acc_t(0)) {
+            const acc_t exponential = exp(beta_value * value);
+            alpha_sum += upstream * (exponential - acc_t(1));
+            beta_sum += upstream * alpha_value * value * exponential;
+            grad_input[index] = static_cast<scalar_t>(
+                upstream * alpha_value * beta_value * exponential
+            );
+        } else {
+            grad_input[index] = static_cast<scalar_t>(upstream);
+        }
+    }
+
+    shared_alpha[threadIdx.x] = alpha_sum;
+    shared_beta[threadIdx.x] = beta_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_alpha[threadIdx.x] += shared_alpha[threadIdx.x + stride];
+            shared_beta[threadIdx.x] += shared_beta[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        gpuAtomicAdd(grad_alpha + channel, shared_alpha[0]);
+        gpuAtomicAdd(grad_beta + channel, shared_beta[0]);
     }
 }
 
+int get_forward_blocks(int64_t num_elements) {
+    // A capped grid works with the grid-stride loop and avoids launching a
+    // needlessly large number of blocks for very large feature maps.
+    constexpr int kMaxBlocks = 4096;
+    return static_cast<int>(std::min<int64_t>(
+        (num_elements + kThreads - 1) / kThreads, kMaxBlocks
+    ));
+}
 
-// ===================================================================
+}  // namespace
 
 torch::Tensor mpelu_forward_cuda(
     const torch::Tensor input,
-    const torch::Tensor a,
-    const torch::Tensor b
-){
+    const torch::Tensor alpha,
+    const torch::Tensor beta
+) {
+    c10::cuda::CUDAGuard device_guard(input.device());
+    auto output = torch::empty_like(input);
+    if (input.numel() == 0) {
+        return output;
+    }
 
-    torch::Tensor output = torch::zeros_like(input);
+    const int64_t channels = input.size(1);
+    const int64_t spatial_size = input.size(2) * input.size(3);
+    const int blocks = get_forward_blocks(input.numel());
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const int threads_per_block = 256;
-    const int batch_size = input.size(0);
-    const int num_channels = input.size(1);
-    const int height = input.size(2);
-    const int width = input.size(3);
-
-    dim3 threadsPerBlock(threads_per_block);
-    dim3 numBlocks(
-        (width * height + threads_per_block - 1) / threads_per_block,
-        num_channels,
-        batch_size
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(), "mpelu_forward_cuda", [&] {
+            mpelu_forward_cuda_kernel<scalar_t><<<blocks, kThreads, 0, stream>>>(
+                input.data_ptr<scalar_t>(),
+                alpha.data_ptr<scalar_t>(),
+                beta.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                input.numel(),
+                channels,
+                spatial_size
+            );
+        }
     );
-    
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "mpelu_forward_cuda", ([&] {
-        mpelu_forward_cuda_kernel<scalar_t><<<numBlocks, threadsPerBlock>>>(
-            input.packed_accessor<scalar_t, 4, torch::RestrictPtrTraits, size_t>(),
-            a.packed_accessor<scalar_t, 1, torch::RestrictPtrTraits, size_t>(),
-            b.packed_accessor<scalar_t, 1, torch::RestrictPtrTraits, size_t>(),
-            output.packed_accessor<scalar_t, 4, torch::RestrictPtrTraits, size_t>(),
-            width, height
-        );
-    }));
-    
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
 void mpelu_backward_cuda(
     const torch::Tensor& input,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& output,
+    const torch::Tensor& alpha,
+    const torch::Tensor& beta,
     const torch::Tensor& grad_output,
     torch::Tensor& grad_input,
-    torch::Tensor& grad_a,
-    torch::Tensor& grad_b
-){
+    torch::Tensor& grad_alpha,
+    torch::Tensor& grad_beta
+) {
+    c10::cuda::CUDAGuard device_guard(input.device());
+    if (input.numel() == 0) {
+        return;
+    }
 
-    grad_input.zero_();
-    grad_a.zero_();
-    grad_b.zero_();
+    const int64_t channels = input.size(1);
+    const int64_t spatial_size = input.size(2) * input.size(3);
+    const int64_t batch_channels = input.size(0) * channels;
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const int batch_size = grad_output.size(0);
-    const int num_channels = grad_output.size(1);
-    const int height = grad_output.size(2);
-    const int width = grad_output.size(3);
-
-    const int threads_per_block = 256;
-    dim3 threadsPerBlock(threads_per_block);
-    dim3 numBlocks(
-        (width * height + threads_per_block - 1) / threads_per_block,
-        num_channels,
-        batch_size
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(), "mpelu_backward_cuda", [&] {
+            using acc_t = at::acc_type<scalar_t, true>;
+            const size_t shared_memory = 2 * kThreads * sizeof(acc_t);
+            mpelu_backward_cuda_kernel<scalar_t>
+                <<<batch_channels, kThreads, shared_memory, stream>>>(
+                    input.data_ptr<scalar_t>(),
+                    alpha.data_ptr<scalar_t>(),
+                    beta.data_ptr<scalar_t>(),
+                    grad_output.data_ptr<scalar_t>(),
+                    grad_input.data_ptr<scalar_t>(),
+                    grad_alpha.data_ptr<acc_t>(),
+                    grad_beta.data_ptr<acc_t>(),
+                    channels,
+                    spatial_size
+                );
+        }
     );
-
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(grad_output.type(), "mpelu_backward_cuda", ([&] {
-        mpelu_backward_cuda_kernel<scalar_t><<<numBlocks, threadsPerBlock>>>(
-            input.packed_accessor<scalar_t,4,torch::RestrictPtrTraits,size_t>(),
-            a.packed_accessor<scalar_t,1,torch::RestrictPtrTraits,size_t>(),
-            b.packed_accessor<scalar_t,1,torch::RestrictPtrTraits,size_t>(),
-            output.packed_accessor<scalar_t,4,torch::RestrictPtrTraits,size_t>(),
-            grad_output.packed_accessor<scalar_t,4,torch::RestrictPtrTraits,size_t>(),
-            grad_input.packed_accessor<scalar_t,4,torch::RestrictPtrTraits,size_t>(),
-            grad_a.packed_accessor<scalar_t,1,torch::RestrictPtrTraits,size_t>(),
-            grad_b.packed_accessor<scalar_t,1,torch::RestrictPtrTraits,size_t>(),
-            width, height
-        );
-    }));
-    
-};
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
